@@ -25,6 +25,7 @@
                     "client_secret": "Client Secret",
                     "user_id": "User ID",
                     "username": "Username",
+                    "transport_preference": "Preferred connection transport",
                     "no_cloud": "Disable Cloud API?"
                 }
             }
@@ -85,6 +86,7 @@
                     "client_secret": "Client Secret",
                     "user_id": "User ID",
                     "username": "Username",
+                    "transport_preference": "Preferred connection transport",
                     "no_cloud": "Disable Cloud API?"
                 }
             },
@@ -92,14 +94,25 @@
                 "title": "Confirmation",
                 "description": "{message}"
             },
+            "ble_pick_cloud_device": {
+                "title": "Select Tuya Cloud Device for BLE credentials",
+                "description": "The BLE device **{mac}** (UUID: `{ble_uuid}`) was not found in your cloud account. Select the matching device from your cloud account to fill in the credentials automatically, or choose **Enter credentials manually**.",
+                "data": {
+                    "cloud_device": "Cloud device"
+                }
+            },
             "configure_device": {
                 "title": "Configure device connectivity",
                 "description": "Configure any device details{for_device} that are empty (if any) to allow LocalTuya to connect to the device.",
                 "data": {
+                    "connection_type": "Connection Type",
                     "friendly_name": "Device Name",
-                    "host": "IP Address",
+                    "host": "IP Address / MAC Address (for Bluetooth LE)",
                     "device_id": "Device ID",
                     "local_key": "Local Key",
+                    "ble_uuid": "BLE Device UUID (from Tuya app)",
+                    "ble_notif_uuid": "(Optional) GATT Notification Characteristic UUID",
+                    "ble_char_uuid": "(Optional) GATT Write Characteristic UUID",
                     "node_id": "(Optional) Sub-devices Node Id",
                     "protocol_version": "Protocol Version",
                     "enable_debug": "Enable debug (must be manually enabled in `configuration.yaml` too)",

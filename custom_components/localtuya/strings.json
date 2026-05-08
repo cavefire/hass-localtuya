@@ -18,7 +18,11 @@
                     "region": "API server region",
                     "client_id": "Client ID",
                     "client_secret": "Secret",
-                    "user_id": "User ID"
+                    "user_id": "User ID",
+                    "connection_type": "Connection Type",
+                    "ble_uuid": "BLE Device UUID",
+                    "ble_notif_uuid": "GATT Notification UUID (optional)",
+                    "ble_char_uuid": "GATT Write UUID (optional)"
                 }
             },
             "power_outlet": {

@@ -2,12 +2,18 @@
   "domain": "localtuya",
   "name": "Local Tuya",
   "codeowners": [],
+  "bluetooth": [
+    {
+      "connectable": true,
+      "service_uuid": "0000a201-0000-1000-8000-00805f9b34fb"
+    }
+  ],
   "config_flow": true,
-  "dependencies": [],
+  "dependencies": ["bluetooth"],
   "documentation": "https://github.com/xZetsubou/hass-localtuya/",
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/xZetsubou/hass-localtuya/issues",
-  "requirements": [],
+  "requirements": ["bleak>=0.21.1"],
   "version": "2025.11.0"
 }

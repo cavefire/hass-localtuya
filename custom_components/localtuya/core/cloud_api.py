@@ -227,7 +227,72 @@ class TuyaCloudApi:
 
         self.device_list.update({dev["id"]: dev for dev in resp["result"]})
 
+        # Also fetch BLE/local devices from the IoT-01 endpoint (BLE devices
+        # are not returned by the v1.0 users endpoint).
+        iot_resp = await self.async_make_request(
+            "GET", url=f"/v1.0/iot-01/associated-users/devices?uid={self._user_id}"
+        )
+        if iot_resp and iot_resp.get("success"):
+            iot_result = iot_resp.get("result", {})
+            iot_devices = (
+                iot_result
+                if isinstance(iot_result, list)
+                else iot_result.get("devices", [])
+            )
+            self._logger.debug("IoT-01 returned %d devices", len(iot_devices))
+            for dev in iot_devices:
+                if dev.get("id") and dev["id"] not in self.device_list:
+                    self.device_list[dev["id"]] = dev
+        else:
+            self._logger.debug("IoT-01 associated-users/devices failed: %s", iot_resp)
+
+        await self.async_get_devices_factory_infos()
+
         self._last_devices_update = int(time.time())
+        return "ok"
+
+    async def async_get_devices_factory_infos(self) -> str | None:
+        """Supplement device_list with factory info such as MAC addresses."""
+        if not self.device_list:
+            return "ok"
+
+        device_ids = list(self.device_list)
+        chunk_size = 50
+        for start in range(0, len(device_ids), chunk_size):
+            chunk = device_ids[start : start + chunk_size]
+            device_ids_param = ",".join(chunk)
+            resp = await self.async_make_request(
+                "GET",
+                url=f"/v1.0/devices/factory-infos?device_ids={device_ids_param}",
+            )
+            if not resp:
+                self._logger.debug(
+                    "Failed to retrieve factory infos for chunk starting at %d", start
+                )
+                continue
+
+            if not resp.get("success"):
+                self._logger.debug(
+                    "Factory infos request failed for chunk starting at %d: %s",
+                    start,
+                    resp,
+                )
+                continue
+
+            result = resp.get("result", [])
+            for factory_dev in result:
+                if not (dev_id := factory_dev.get("id")):
+                    continue
+                if dev_id not in self.device_list:
+                    continue
+                self.device_list[dev_id].update(
+                    {
+                        key: value
+                        for key, value in factory_dev.items()
+                        if value not in (None, "")
+                    }
+                )
+
         return "ok"
 
     async def async_get_devices_dps_query(self):

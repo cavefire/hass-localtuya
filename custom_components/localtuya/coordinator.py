@@ -12,11 +12,15 @@ from typing import Any, NamedTuple
 from homeassistant.core import HomeAssistant, CALLBACK_TYPE, callback, State
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ID, CONF_DEVICES, CONF_HOST, CONF_DEVICE_ID
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
 from homeassistant.helpers.event import async_track_time_interval, async_call_later
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     dispatcher_send,
 )
+from homeassistant.components import bluetooth
+from habluetooth import BluetoothScanningMode
 
 from .core.cloud_api import TuyaCloudApi
 from .core.pytuya import (
@@ -28,19 +32,32 @@ from .core.pytuya import (
     TuyaProtocol,
     connect as pytuya_connect,
 )
+from .core.pytuya_ble import TuyaBLEProtocol
 from .core.pytuya.parser import DecodeError
 
 from .const import (
     ATTR_UPDATED_AT,
+    CONF_BLE_CHAR_UUID,
+    CONF_BLE_HOST,
+    CONF_BLE_NOTIF_UUID,
+    CONF_BLE_UUID,
     CONF_GATEWAY_ID,
     CONF_LOCAL_KEY,
     CONF_NODE_ID,
     CONF_NO_CLOUD,
+    CONF_TRANSPORT_PREFERENCE,
     CONF_TUYA_IP,
+    CONF_WIFI_HOST,
+    CONNECTION_TYPE_BLE,
+    CONNECTION_TYPE_WIFI,
     DATA_DISCOVERY,
     DOMAIN,
     DeviceConfig,
     RESTORE_STATES,
+    TRANSPORT_BLE_ONLY,
+    TRANSPORT_PREFER_BLE,
+    TRANSPORT_PREFER_WIFI,
+    TRANSPORT_WIFI_ONLY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -97,6 +114,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._task_shutdown_entities: asyncio.Task | None = None
         self._unsub_refresh: CALLBACK_TYPE | None = None
         self._unsub_new_entity: CALLBACK_TYPE | None = None
+        self._unsub_ble: CALLBACK_TYPE | None = None
+        self._active_transport: str | None = None
 
         self._entities = []
 
@@ -151,6 +170,183 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         """
         return self.is_subdevice and "0" in self._device_config.manual_dps.split(",")
 
+    @property
+    def is_ble_device(self) -> bool:
+        """Return True when this device communicates over Bluetooth LE."""
+        return self._active_transport == CONNECTION_TYPE_BLE
+
+    @property
+    def active_transport(self) -> str | None:
+        """Return the transport currently in use."""
+        return self._active_transport
+
+    @property
+    def supports_ble(self) -> bool:
+        """Return whether Bluetooth transport is available for this device."""
+        return (
+            not self.is_subdevice
+            and bool(self._device_config.ble_host)
+            and bool(self._device_config.ble_uuid)
+        )
+
+    @property
+    def supports_wifi(self) -> bool:
+        """Return whether WiFi transport is available for this device."""
+        return bool(self._device_config.wifi_host)
+
+    @callback
+    def _async_update_connected_via(self) -> None:
+        """Register BLE MAC on the LocalTuya device and clean stale transport devices."""
+        if self.is_subdevice:
+            return
+
+        device_registry = dr.async_get(self.hass)
+        if not (
+            local_device := device_registry.async_get_device(
+                identifiers={(DOMAIN, f"local_{self._device_config.id}")}
+            )
+        ):
+            return
+
+        if stale_transport_device := device_registry.async_get_device(
+            identifiers={(DOMAIN, f"local_{self._device_config.id}_ble_transport")}
+        ):
+            device_registry.async_update_device(
+                stale_transport_device.id,
+                remove_config_entry_id=self._entry.entry_id,
+            )
+
+        if not self._device_config.ble_host:
+            return
+
+        bluetooth_address = dr.format_mac(self._device_config.ble_host)
+        bluetooth_connection = (CONNECTION_BLUETOOTH, bluetooth_address)
+        if bluetooth_connection in local_device.connections:
+            return
+
+        device_registry.async_update_device(
+            local_device.id,
+            merge_connections={bluetooth_connection},
+        )
+
+    def _transport_candidates(self) -> list[tuple[str, str]]:
+        """Return ordered transport candidates based on global preference."""
+        preference = self._entry.data.get(
+            CONF_TRANSPORT_PREFERENCE, TRANSPORT_PREFER_WIFI
+        )
+        wifi_candidate = (
+            (CONNECTION_TYPE_WIFI, self._device_config.wifi_host)
+            if self.supports_wifi
+            else None
+        )
+        ble_candidate = (
+            (CONNECTION_TYPE_BLE, self._device_config.ble_host)
+            if self.supports_ble
+            else None
+        )
+
+        if self.is_subdevice:
+            return [wifi_candidate] if wifi_candidate else []
+        if preference == TRANSPORT_WIFI_ONLY:
+            return [wifi_candidate] if wifi_candidate else []
+        if preference == TRANSPORT_BLE_ONLY:
+            return [ble_candidate] if ble_candidate else []
+        if preference == TRANSPORT_PREFER_BLE:
+            return [candidate for candidate in (ble_candidate, wifi_candidate) if candidate]
+        return [candidate for candidate in (wifi_candidate, ble_candidate) if candidate]
+
+    async def _connect_via_ble(self, host: str) -> tuple[bool, bool]:
+        """Attempt to connect via Bluetooth LE."""
+        try:
+            from .core.pytuya_ble.const import DEFAULT_CHAR_UUID, DEFAULT_NOTIF_UUID
+
+            notif_uuid = self._device_config.ble_notif_uuid or DEFAULT_NOTIF_UUID
+            char_uuid = self._device_config.ble_char_uuid or DEFAULT_CHAR_UUID
+            self._interface = TuyaBLEProtocol(
+                dev_id=self._device_config.id,
+                local_key=self.local_key,
+                ble_uuid=self._device_config.ble_uuid,
+                listener=self,
+                notif_uuid=notif_uuid,
+                char_uuid=char_uuid,
+            )
+            self._interface.add_dps_to_request(self.dps_to_request)
+            await self._interface.connect(self.hass, host)
+            self._active_transport = CONNECTION_TYPE_BLE
+            return True, False
+        except asyncio.CancelledError:
+            await self.abort_connect()
+            self._task_connect = None
+            raise
+        except OSError as err:
+            await self.abort_connect()
+            if not self.is_sleep:
+                self.warning(f"BLE connection failed: {err}")
+            return False, False
+        except Exception as ex:  # pylint: disable=broad-except
+            await self.abort_connect()
+            if not self.is_sleep:
+                self.warning(f"Failed to connect to BLE device {host}: {str(ex)}")
+            return False, "key" in str(ex)
+
+    async def _connect_via_wifi(self, host: str) -> tuple[bool, bool]:
+        """Attempt to connect via WiFi / LAN."""
+        retry = 0
+        max_retries = 3
+        update_localkey = False
+        while retry < max_retries and not self.is_closing:
+            retry += 1
+            try:
+                if self.is_subdevice:
+                    gateway = self._get_gateway()
+                    if not gateway:
+                        update_localkey = True
+                        break
+                    if not gateway.connected and gateway.is_connecting:
+                        await self.abort_connect()
+                        return False, update_localkey
+                    self._interface = gateway._interface
+                    if not self._interface:
+                        break
+                    if self._device_config.enable_debug:
+                        self._interface.enable_debug(True, gateway.friendly_name)
+                else:
+                    self._interface = await pytuya_connect(
+                        host,
+                        self._device_config.id,
+                        self.local_key,
+                        float(self._device_config.protocol_version),
+                        self._device_config.enable_debug,
+                        self,
+                    )
+                    self._interface.enable_debug(
+                        self._device_config.enable_debug, self.friendly_name
+                    )
+                self._interface.add_dps_to_request(self.dps_to_request)
+                self._active_transport = CONNECTION_TYPE_WIFI
+                return True, update_localkey
+            except asyncio.CancelledError:
+                await self.abort_connect()
+                self._task_connect = None
+                raise
+            except OSError as err:
+                await self.abort_connect()
+                if (
+                    err.errno == errno.EHOSTUNREACH
+                    and not self._status
+                    and not self.is_sleep
+                ):
+                    self.warning(f"Connection failed: {err}")
+                    break
+            except Exception as ex:  # pylint: disable=broad-except
+                await self.abort_connect()
+                if not self.is_sleep:
+                    self.warning(f"Failed to connect to {host}: {str(ex)}")
+                if "key" in str(ex):
+                    update_localkey = True
+                    break
+        return False, update_localkey
+
     def add_entities(self, entities):
         """Set the entities associated with this device."""
         self._entities.extend(entities)
@@ -182,82 +378,54 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self.is_sleep and not self._status:
             self.status_updated(RESTORE_STATES)
 
-        name, host = self._device_config.name, self._device_config.host
-        retry = 0
-        max_retries = 3
+        name = self._device_config.name
+        host = self._device_config.host
         update_localkey = False
+        self._active_transport = None
 
-        self.debug(f"Trying to connect to: {host}...", force=True)
-        # Connect to the device, interface should be connected for next steps.
-        while retry < max_retries and not self.is_closing:
-            retry += 1
-            try:
-                if self.is_subdevice:
-                    gateway = self._get_gateway()
-                    if not gateway:
-                        update_localkey = True
-                        break
-                    if not gateway.connected and gateway.is_connecting:
-                        return await self.abort_connect()
-                    self._interface = gateway._interface
-                    if not self._interface:
-                        break
-                    if self._device_config.enable_debug:
-                        self._interface.enable_debug(True, gateway.friendly_name)
-                else:
-                    self._interface = await pytuya_connect(
-                        self._device_config.host,
-                        self._device_config.id,
-                        self.local_key,
-                        float(self._device_config.protocol_version),
-                        self._device_config.enable_debug,
-                        self,
-                    )
-                    self._interface.enable_debug(
-                        self._device_config.enable_debug, self.friendly_name
-                    )
-                self._interface.add_dps_to_request(self.dps_to_request)
-                break  # Succeed break while loop
-            except asyncio.CancelledError:
-                await self.abort_connect()
-                self._task_connect = None
-                return
-            except OSError as e:
-                await self.abort_connect()
-                if (
-                    e.errno == errno.EHOSTUNREACH
-                    and not self._status
-                    and not self.is_sleep
-                ):
-                    self.warning(f"Connection failed: {e}")
-                    break
-            except Exception as ex:  # pylint: disable=broad-except
-                await self.abort_connect()
-                if not self.is_sleep:
-                    self.warning(f"Failed to connect to {host}: {str(ex)}")
-                if "key" in str(ex):
-                    update_localkey = True
-                    break
+        for transport, candidate_host in self._transport_candidates():
+            host = candidate_host
+            self.debug(
+                f"Trying to connect via {transport} to: {candidate_host}...",
+                force=True,
+            )
+            if transport == CONNECTION_TYPE_BLE:
+                connected, should_update_localkey = await self._connect_via_ble(
+                    candidate_host
+                )
+            else:
+                connected, should_update_localkey = await self._connect_via_wifi(
+                    candidate_host
+                )
+            update_localkey = update_localkey or should_update_localkey
+            if connected:
+                break
 
         # Get device status and configure DPS.
         if self.connected and not self.is_closing:
             try:
-                # If reset dpids set - then assume reset is needed before status.
-                reset_dpids = self._default_reset_dpids
-                if (reset_dpids is not None) and (len(reset_dpids) > 0):
-                    self.debug(f"Resetting cmd for DP IDs: {reset_dpids}")
-                    # Assume we want to request status updated for the same set of DP_IDs as the reset ones.
-                    self._interface.set_updatedps_list(reset_dpids)
+                if self._active_transport != CONNECTION_TYPE_BLE:
+                    # If reset dpids set - then assume reset is needed before status.
+                    reset_dpids = self._default_reset_dpids
+                    if (reset_dpids is not None) and (len(reset_dpids) > 0):
+                        self.debug(f"Resetting cmd for DP IDs: {reset_dpids}")
+                        # Assume we want to request status updated for the same set of DP_IDs as the reset ones.
+                        self._interface.set_updatedps_list(reset_dpids)
 
-                    # Reset the interface
-                    await self._interface.reset(reset_dpids, cid=self._node_id)
+                        # Reset the interface
+                        await self._interface.reset(reset_dpids, cid=self._node_id)
 
-                self.debug("Retrieving initial state")
-                status = await self._interface.status(cid=self._node_id)
-                if status is None:
-                    raise Exception("Failed to retrieve status")
+                    self.debug("Retrieving initial state")
+                    status = await self._interface.status(cid=self._node_id)
+                    if status is None:
+                        raise Exception("Failed to retrieve status")
 
-                self.status_updated(status)
+                    self.status_updated(status)
+                else:
+                    # BLE: device pushes status via notifications after pairing.
+                    # Restore any previously cached state so entities aren't unavailable.
+                    if not self._status:
+                        self.status_updated(RESTORE_STATES)
             except (UnicodeDecodeError, DecodeError) as e:
                 self.exception(f"Handshake with {host} failed: due to {type(e)}: {e}")
                 await self.abort_connect()
@@ -282,6 +450,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         # Connect and configure the entities, at this point the device should be ready to get commands.
         if self.connected and not self.is_closing:
             self.debug(f"Success: connected to: {host}", force=True)
+            self._async_update_connected_via()
             # Attempt to restore status for all entities that need to first set
             # the DPS value before the device will respond with status.
             for entity in self._entities:
@@ -341,6 +510,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self._interface is not None:
             await self._interface.close()
             self._interface = None
+        self._active_transport = None
 
     async def check_connection(self):
         """Ensure that the device is not still connecting; if it is, wait for it."""
@@ -375,6 +545,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self._unsub_refresh()
             self._unsub_refresh = None
 
+        if self._unsub_ble:
+            self._unsub_ble()
+            self._unsub_ble = None
+
         await self.abort_connect()
 
         if self.gateway:
@@ -388,9 +562,9 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             payload, self._pending_status = self._pending_status.copy(), {}
             try:
                 await self._interface.set_dps(payload, cid=self._node_id)
-                # bluetooth devices usually does not send updated status payload.
+                # Bluetooth devices usually don't send an updated status payload.
                 # NOTE: This will override the status if the BLE device fails to receive the signal.
-                if self.is_write_only:
+                if self.is_write_only or self.is_ble_device:
                     self.status_updated(payload)
             except (TimeoutError, Exception) as ex:
                 self.debug(f"Failed to set values {payload} --> {ex}", force=True)
@@ -426,9 +600,37 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             except TimeoutError:
                 pass
 
+    @callback
+    def _setup_ble_advertisement_listener(self) -> None:
+        """Register a BLE advertisement callback so we connect the moment the device advertises."""
+        if self._unsub_ble is not None:
+            return
+        mac = self._device_config.ble_host
+        if not mac:
+            return
+
+        @callback
+        def _on_ble_advertisement(service_info, change) -> None:
+            if not self.connected and not self.is_closing:
+                self.debug(
+                    f"BLE advertisement received from {mac}, triggering connect",
+                    force=True,
+                )
+                asyncio.ensure_future(self.async_connect())
+
+        self._unsub_ble = bluetooth.async_register_callback(
+            self.hass,
+            _on_ble_advertisement,
+            {"address": mac, "connectable": True},
+            BluetoothScanningMode.ACTIVE,
+        )
+        self.debug(f"Registered BLE advertisement listener for {mac}", force=True)
+
     async def _async_reconnect(self):
         """Task: continuously attempt to reconnect to the device."""
         attempts = 0
+        if self.supports_ble and self._entry.data.get(CONF_TRANSPORT_PREFERENCE) != TRANSPORT_WIFI_ONLY:
+            self._setup_ble_advertisement_listener()
         while True:
             try:
                 # for sub-devices, if it is reported as offline then no need for reconnect.
@@ -614,6 +816,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if not self._interface:
             return
         self._interface = None
+        self._active_transport = None
+        self._async_update_connected_via()
 
         if self._unsub_refresh:
             self._unsub_refresh()
@@ -638,6 +842,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._task_shutdown_entities = asyncio.create_task(
             self._shutdown_entities(exc=exc)
         )
+        self._dispatch_status()
 
     @callback
     def subdevice_state_updated(self, state: SubdeviceState):

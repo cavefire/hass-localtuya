@@ -11,6 +11,7 @@ import homeassistant.helpers.config_validation as cv
 import homeassistant.helpers.device_registry as dr
 import homeassistant.helpers.entity_registry as er
 import voluptuous as vol
+from homeassistant.components.bluetooth import async_discovered_service_info
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import (
     CONF_CLIENT_ID,
@@ -33,14 +34,23 @@ from .coordinator import TuyaDevice, HassLocalTuyaData, TuyaCloudApi
 from .config_flow import ENTRIES_VERSION
 from .const import (
     ATTR_UPDATED_AT,
+    CONF_BLE_HOST,
+    CONF_BLE_UUID,
     CONF_GATEWAY_ID,
     CONF_NODE_ID,
     CONF_NO_CLOUD,
     CONF_PRODUCT_KEY,
+    CONF_TRANSPORT_PREFERENCE,
     CONF_USER_ID,
+    CONF_WIFI_HOST,
+    CONNECTION_TYPE_BLE,
+    CONNECTION_TYPE_WIFI,
     DATA_DISCOVERY,
     DOMAIN,
+    normalize_mac,
     PLATFORMS,
+    TRANSPORT_PREFER_WIFI,
+    TUYA_BLE_SERVICE_UUID,
 )
 
 from .discovery import TuyaDiscovery
@@ -58,6 +68,80 @@ SERVICE_SET_DP_SCHEMA = vol.Schema(
         vol.Required(CONF_VALUE): object,
     }
 )
+
+
+async def _async_update_entry_device_transports(
+    hass: HomeAssistant, entry: ConfigEntry, tuya_api: TuyaCloudApi
+) -> None:
+    """Backfill WiFi/BLE endpoints for configured devices from discovery and cloud data."""
+    new_data = entry.data.copy()
+    devices = new_data[CONF_DEVICES]
+    updated = False
+
+    for dev_id, config in devices.items():
+        if config.get(CONF_CONNECTION_TYPE) == CONNECTION_TYPE_BLE:
+            if config.get(CONF_HOST) and not config.get(CONF_BLE_HOST):
+                config[CONF_BLE_HOST] = config[CONF_HOST]
+                updated = True
+        elif config.get(CONF_HOST) and not config.get(CONF_WIFI_HOST):
+            config[CONF_WIFI_HOST] = config[CONF_HOST]
+            updated = True
+
+    all_ble = list(async_discovered_service_info(hass, connectable=True))
+    ble_by_cloud_id: dict[str, tuple[str, str]] = {}
+    for service_info in all_ble:
+        if TUYA_BLE_SERVICE_UUID not in service_info.service_uuids:
+            continue
+        ble_mac = service_info.address
+        ble_mac_norm = normalize_mac(ble_mac)
+        mac_minus1 = f"{max(0, int(ble_mac_norm, 16) - 1):012x}"
+        svc_data = (service_info.service_data or {}).get(TUYA_BLE_SERVICE_UUID, b"")
+        ble_uuid = svc_data[1:17].hex() if len(svc_data) >= 17 else ""
+        for cloud_dev_id, cloud_dev in tuya_api.device_list.items():
+            cloud_mac = normalize_mac(cloud_dev.get("mac", ""))
+            if cloud_mac and cloud_mac in (ble_mac_norm, mac_minus1):
+                ble_by_cloud_id[cloud_dev_id] = (ble_mac, ble_uuid)
+                break
+
+    for dev_id, config in devices.items():
+        if dev_id in ble_by_cloud_id:
+            ble_host, ble_uuid = ble_by_cloud_id[dev_id]
+            if config.get(CONF_BLE_HOST) != ble_host:
+                config[CONF_BLE_HOST] = ble_host
+                updated = True
+            if ble_uuid and not config.get(CONF_BLE_UUID):
+                config[CONF_BLE_UUID] = ble_uuid
+                updated = True
+
+        if discovery := hass.data[DOMAIN].get(DATA_DISCOVERY):
+            if local_dev := discovery.devices.get(dev_id):
+                wifi_host = local_dev.get(CONF_TUYA_IP)
+                if wifi_host and config.get(CONF_WIFI_HOST) != wifi_host:
+                    previous_wifi_host = config.get(CONF_WIFI_HOST) or config.get(
+                        CONF_HOST
+                    )
+                    config[CONF_WIFI_HOST] = wifi_host
+                    if config.get(CONF_HOST) == previous_wifi_host:
+                        config[CONF_HOST] = wifi_host
+                    updated = True
+
+        if config.get(CONF_WIFI_HOST) and config.get(CONF_HOST) == config.get(CONF_BLE_HOST):
+            config[CONF_HOST] = config[CONF_WIFI_HOST]
+            updated = True
+        if not config.get(CONF_HOST):
+            config[CONF_HOST] = config.get(CONF_WIFI_HOST) or config.get(CONF_BLE_HOST)
+            updated = True
+        if config.get(CONF_WIFI_HOST) and not config.get(CONF_CONNECTION_TYPE):
+            config[CONF_CONNECTION_TYPE] = CONNECTION_TYPE_WIFI
+            updated = True
+
+    if not new_data.get(CONF_TRANSPORT_PREFERENCE):
+        new_data[CONF_TRANSPORT_PREFERENCE] = TRANSPORT_PREFER_WIFI
+        updated = True
+
+    if updated:
+        new_data[ATTR_UPDATED_AT] = str(int(time.time() * 1000))
+        hass.config_entries.async_update_entry(entry, data=new_data)
 
 
 async def async_setup(hass: HomeAssistant, config: dict):
@@ -146,7 +230,12 @@ async def async_setup(hass: HomeAssistant, config: dict):
             dev_entry = entry.data[CONF_DEVICES][dev_id]
             if host != device_ip:
                 updated = True
-                new_data[CONF_DEVICES][dev_id][CONF_HOST] = device_ip
+                previous_wifi_host = new_data[CONF_DEVICES][dev_id].get(
+                    CONF_WIFI_HOST, host
+                )
+                new_data[CONF_DEVICES][dev_id][CONF_WIFI_HOST] = device_ip
+                if new_data[CONF_DEVICES][dev_id].get(CONF_HOST) == previous_wifi_host:
+                    new_data[CONF_DEVICES][dev_id][CONF_HOST] = device_ip
                 device_cache[device_id][dev_id] = device_ip
 
             if (p_key := dev_entry.get(CONF_PRODUCT_KEY)) and p_key != product_key:
@@ -312,8 +401,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     if no_cloud:
         _LOGGER.info(f"Cloud API account not configured.")
     else:
+        async def _async_cloud_setup() -> None:
+            status, detail = await tuya_api.async_connect()
+            if status is not True:
+                _LOGGER.warning(
+                    "Cloud API startup refresh failed for %s: %s (%s)",
+                    entry.entry_id,
+                    status,
+                    detail,
+                )
+                return
+            await _async_update_entry_device_transports(hass, entry, tuya_api)
+
         entry.async_create_background_task(
-            hass, tuya_api.async_connect(), "localtuya-cloudAPI"
+            hass, _async_cloud_setup(), "localtuya-cloudAPI"
         )
 
     hass_localtuya = HassLocalTuyaData(tuya_api, {})

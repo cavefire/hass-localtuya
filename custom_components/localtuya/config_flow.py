@@ -21,6 +21,7 @@ from homeassistant.helpers.selector import (
 )
 import voluptuous as vol
 from homeassistant import exceptions
+from homeassistant.components.bluetooth import async_discovered_service_info
 from homeassistant.core import callback, HomeAssistant
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.const import (
@@ -49,7 +50,12 @@ from .core.helpers import templates, get_gateway_by_deviceid, gen_localtuya_enti
 from .const import (
     ATTR_UPDATED_AT,
     CONF_ADD_DEVICE,
+    CONF_BLE_CHAR_UUID,
+    CONF_BLE_HOST,
+    CONF_BLE_NOTIF_UUID,
+    CONF_BLE_UUID,
     CONF_CONFIGURE_CLOUD,
+    CONF_CONNECTION_TYPE,
     CONF_DPS_STRINGS,
     CONF_EDIT_DEVICE,
     CONF_ENABLE_ADD_ENTITIES,
@@ -64,10 +70,14 @@ from .const import (
     CONF_PRODUCT_NAME,
     CONF_PROTOCOL_VERSION,
     CONF_RESET_DPIDS,
+    CONF_TRANSPORT_PREFERENCE,
     CONF_TUYA_GWID,
     CONF_TUYA_IP,
     CONF_TUYA_VERSION,
     CONF_USER_ID,
+    CONF_WIFI_HOST,
+    CONNECTION_TYPE_BLE,
+    CONNECTION_TYPE_WIFI,
     DATA_DISCOVERY,
     DEFAULT_CATEGORIES,
     DOMAIN,
@@ -75,6 +85,10 @@ from .const import (
     PLATFORMS,
     SUPPORTED_PROTOCOL_VERSIONS,
     CONF_DEVICE_SLEEP_TIME,
+    TRANSPORT_BLE_ONLY,
+    TRANSPORT_PREFER_BLE,
+    TRANSPORT_PREFER_WIFI,
+    TRANSPORT_WIFI_ONLY,
 )
 from .discovery import discover
 
@@ -136,6 +150,16 @@ CLOUD_CONFIGURE_SCHEMA = vol.Schema(
         vol.Optional(CONF_CLIENT_SECRET): cv.string,
         vol.Optional(CONF_USER_ID): cv.string,
         vol.Optional(CONF_USERNAME, default=DOMAIN): cv.string,
+        vol.Required(
+            CONF_TRANSPORT_PREFERENCE, default=TRANSPORT_PREFER_WIFI
+        ): col_to_select(
+            {
+                "Prefer WiFi, fall back to Bluetooth": TRANSPORT_PREFER_WIFI,
+                "Prefer Bluetooth, fall back to WiFi": TRANSPORT_PREFER_BLE,
+                "WiFi only": TRANSPORT_WIFI_ONLY,
+                "Bluetooth only": TRANSPORT_BLE_ONLY,
+            }
+        ),
         vol.Required(CONF_NO_CLOUD, default=False): bool,
     }
 )
@@ -155,6 +179,20 @@ DEVICE_SCHEMA = vol.Schema(
         vol.Optional(CONF_RESET_DPIDS): str,
         vol.Optional(CONF_DEVICE_SLEEP_TIME): int,
         vol.Optional(CONF_NODE_ID, default=None): vol.Any(None, cv.string),
+    }
+)
+
+DEVICE_SCHEMA_BLE = vol.Schema(
+    {
+        vol.Required(CONF_FRIENDLY_NAME): cv.string,
+        vol.Required(CONF_HOST): cv.string,  # MAC address
+        vol.Required(CONF_DEVICE_ID): cv.string,
+        vol.Required(CONF_LOCAL_KEY): cv.string,
+        vol.Required(CONF_BLE_UUID): cv.string,
+        vol.Required(CONF_ENABLE_DEBUG, default=False): bool,
+        vol.Optional(CONF_MANUAL_DPS): cv.string,
+        vol.Optional(CONF_BLE_NOTIF_UUID): cv.string,
+        vol.Optional(CONF_BLE_CHAR_UUID): cv.string,
     }
 )
 
@@ -254,6 +292,10 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         self.entities = []
         self.use_template = False
         self.template_device = None
+        self._is_ble_device: bool = False
+        self._ble_unmatched_device: str | None = (
+            None  # MAC key when BLE has no cloud match
+        )
 
     @property
     def localtuya_data(self) -> HassLocalTuyaData:
@@ -263,6 +305,104 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
     def cloud_data(self) -> TuyaCloudApi:
         return self.localtuya_data.cloud_data
 
+    async def _async_ensure_cloud_devices(self, force_update: bool = False) -> None:
+        """Ensure the cloud device list is available before using it."""
+        if self.config_entry.data.get(CONF_NO_CLOUD, True):
+            return
+
+        if force_update or not self.cloud_data.device_list:
+            result = await self.cloud_data.async_get_devices_list(
+                force_update=force_update
+            )
+            if result not in (None, "ok"):
+                _LOGGER.warning(
+                    "Failed to refresh LocalTuya cloud devices: %s", result
+                )
+
+    def _store_ble_cloud_credentials(self, ble_dev_id: str, cloud_dev_id: str) -> None:
+        """Persist the chosen cloud device on the BLE discovery record."""
+        stored = self.discovered_devices[ble_dev_id]
+        cloud_dev = self.cloud_data.device_list[cloud_dev_id]
+        mfr_dev_uuid = stored.get("ble_mfr_dev_uuid", "")
+        ble_dev_uuid = stored.get("ble_dev_uuid", "")
+
+        stored["_cloud_device_id"] = cloud_dev_id
+        stored["_cloud_local_key"] = cloud_dev.get(CONF_LOCAL_KEY, "")
+        stored["_cloud_friendly_name"] = cloud_dev.get(CONF_NAME, "")
+        stored["_cloud_ble_uuid"] = (
+            cloud_dev.get("uuid", "") or mfr_dev_uuid or ble_dev_uuid
+        )
+
+    def _get_ble_cloud_matches(
+        self,
+        ble_dev_id: str,
+        device: dict[str, Any],
+        cloud_devs: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return scored cloud matches for a BLE device."""
+        ble_dev_uuid = device.get("ble_dev_uuid", "")
+        raw_svc_data = device.get("ble_raw_svc_data", b"")
+        mfr_dev_uuid = device.get("ble_mfr_dev_uuid", "")
+        raw_mfr_data = device.get("ble_raw_mfr_data", b"")
+        mac_norm = normalize_mac(ble_dev_id)
+        mac_minus1 = f"{max(0, int(mac_norm, 16) - 1):012x}"
+
+        svc_candidates = set()
+        for raw_data in (raw_svc_data, raw_mfr_data):
+            for start in range(len(raw_data)):
+                for length in (4, 6, 8, 10, 12, 16, 20):
+                    chunk = raw_data[start : start + length]
+                    if len(chunk) == length:
+                        svc_candidates.add(chunk.hex())
+
+        _LOGGER.debug(
+            "[BLE cloud match] BLE MAC=%s normalized=%s (also trying mac-1=%s)",
+            ble_dev_id,
+            mac_norm,
+            mac_minus1,
+        )
+
+        matches: list[dict[str, Any]] = []
+        for cloud_dev_id, cloud_dev in cloud_devs.items():
+            cloud_mac = normalize_mac(cloud_dev.get("mac", ""))
+            cloud_uuid = cloud_dev.get("uuid", "").replace("-", "").lower()
+            exact_mac_match = bool(cloud_mac and cloud_mac == mac_norm)
+            mac_minus1_match = bool(cloud_mac and cloud_mac == mac_minus1)
+            uuid_match = bool(cloud_uuid and cloud_uuid in svc_candidates)
+
+            if exact_mac_match:
+                matches.append(
+                    {
+                        "cloud_device_id": cloud_dev_id,
+                        "score": 300,
+                        "reason": "exact_mac",
+                    }
+                )
+                continue
+
+            if mac_minus1_match:
+                matches.append(
+                    {
+                        "cloud_device_id": cloud_dev_id,
+                        "score": 250,
+                        "reason": "mac_minus1",
+                    }
+                )
+                continue
+
+            if uuid_match:
+                matches.append(
+                    {
+                        "cloud_device_id": cloud_dev_id,
+                        "score": 100,
+                        "reason": "uuid_fragment",
+                    }
+                )
+
+        matches.sort(key=lambda item: (-item["score"], item["cloud_device_id"]))
+        _LOGGER.debug("[BLE cloud match] scored matches: %s", matches)
+        return matches
+
     async def async_step_init(self, user_input=None):
         """Manage basic options."""
         configure_menu = CONFIGURE_MENU.copy()
@@ -270,8 +410,7 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         if not self.config_entry.data[CONF_DEVICES]:
             configure_menu.pop(configure_menu.index(CONF_EDIT_DEVICE))
 
-        if not self.config_entry.data.get(CONF_NO_CLOUD, True):
-            self.hass.async_create_task(self.cloud_data.async_get_devices_list())
+        await self._async_ensure_cloud_devices()
 
         return self.async_show_menu(step_id="init", menu_options=configure_menu)
 
@@ -322,6 +461,8 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         self.editing_device = False
         self.selected_device = None
         errors = {}
+        await self._async_ensure_cloud_devices()
+
         if user_input is not None:
             if user_input[SELECTED_DEVICE] != CUSTOM_DEVICE["Add Device Manually"]:
                 self.selected_device = user_input[SELECTED_DEVICE]
@@ -368,6 +509,88 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         allDevices = mergeDevicesList(
             self.discovered_devices, self.cloud_data.device_list
         )
+        for merged_device in allDevices.values():
+            wifi_host = merged_device.get(CONF_TUYA_IP) or merged_device.get(CONF_HOST)
+            if wifi_host:
+                merged_device[CONF_WIFI_HOST] = wifi_host
+                merged_device.setdefault(CONF_HOST, wifi_host)
+
+        # Add BLE-discovered Tuya devices
+        all_ble = list(async_discovered_service_info(self.hass, connectable=True))
+        for service_info in all_ble:
+            if TUYA_BLE_SERVICE_UUID in service_info.service_uuids:
+                mac = service_info.address
+                _LOGGER.debug("[BLE discovery] Tuya BLE device found: %s", mac)
+                # Extract the device UUID from service_data bytes[1:17]
+                svc_data = (service_info.service_data or {}).get(
+                    TUYA_BLE_SERVICE_UUID, b""
+                )
+                ble_dev_uuid = svc_data[1:17].hex() if len(svc_data) >= 17 else ""
+                # Extract Tuya manufacturer data (company ID 0x07D0)
+                mfr_all = service_info.manufacturer_data or {}
+                tuya_mfr = mfr_all.get(0x07D0, b"")
+                # bytes 6-13 of Tuya manufacturer data encode a device UUID
+                mfr_dev_uuid = tuya_mfr[6:14].hex() if len(tuya_mfr) >= 14 else ""
+                ble_device = {
+                    CONF_HOST: mac,
+                    CONF_BLE_HOST: mac,
+                    CONF_CONNECTION_TYPE: CONNECTION_TYPE_BLE,
+                    CONF_FRIENDLY_NAME: service_info.name or f"Tuya BLE {mac}",
+                    "ble_dev_uuid": ble_dev_uuid,
+                    "ble_raw_svc_data": bytes(svc_data),
+                    "ble_mfr_dev_uuid": mfr_dev_uuid,
+                    "ble_raw_mfr_data": bytes(tuya_mfr),
+                }
+                matches = self._get_ble_cloud_matches(
+                    mac, ble_device, self.cloud_data.device_list
+                )
+                top_match = matches[0] if matches else None
+                matched_cloud_id = None
+                if top_match is not None:
+                    equally_scored = [
+                        match
+                        for match in matches
+                        if match["score"] == top_match["score"]
+                    ]
+                    if top_match["score"] >= 250 and len(equally_scored) == 1:
+                        matched_cloud_id = top_match["cloud_device_id"]
+
+                if matched_cloud_id is not None:
+                    merged_device = allDevices.get(
+                        matched_cloud_id,
+                        {
+                            CONF_HOST: mac,
+                            CONF_CONNECTION_TYPE: CONNECTION_TYPE_BLE,
+                            CONF_FRIENDLY_NAME: self.cloud_data.device_list[
+                                matched_cloud_id
+                            ].get(CONF_NAME, ble_device[CONF_FRIENDLY_NAME]),
+                        },
+                    )
+                    merged_device[CONF_BLE_HOST] = mac
+                    merged_device["ble_dev_uuid"] = ble_dev_uuid
+                    merged_device["ble_raw_svc_data"] = bytes(svc_data)
+                    merged_device["ble_mfr_dev_uuid"] = mfr_dev_uuid
+                    merged_device["ble_raw_mfr_data"] = bytes(tuya_mfr)
+                    merged_device[CONF_FRIENDLY_NAME] = self.cloud_data.device_list[
+                        matched_cloud_id
+                    ].get(CONF_NAME, merged_device.get(CONF_FRIENDLY_NAME))
+                    wifi_host = merged_device.get(CONF_WIFI_HOST) or merged_device.get(
+                        CONF_TUYA_IP
+                    )
+                    if wifi_host:
+                        merged_device[CONF_WIFI_HOST] = wifi_host
+                        merged_device.setdefault(CONF_HOST, wifi_host)
+                        merged_device.setdefault(
+                            CONF_CONNECTION_TYPE, CONNECTION_TYPE_WIFI
+                        )
+                    else:
+                        merged_device[CONF_HOST] = mac
+                        merged_device[CONF_CONNECTION_TYPE] = CONNECTION_TYPE_BLE
+                    allDevices[matched_cloud_id] = merged_device
+                    continue
+
+                if mac not in allDevices:
+                    allDevices[mac] = ble_device
 
         self.discovered_devices = allDevices
         devices = {}
@@ -382,8 +605,17 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             if dev_id not in configured_Devices:
                 if dev.get(CONF_NODE_ID, None) is not None:
                     devices[dev_id] = "Sub Device"
+                elif dev.get(CONF_BLE_HOST) and (
+                    dev.get(CONF_WIFI_HOST) or dev.get(CONF_TUYA_IP)
+                ):
+                    wifi_host = dev.get(CONF_WIFI_HOST) or dev.get(CONF_TUYA_IP, "")
+                    devices[dev_id] = f"{wifi_host} + BLE {dev.get(CONF_BLE_HOST)}"
+                elif dev.get(CONF_BLE_HOST) or dev.get(CONF_CONNECTION_TYPE) == CONNECTION_TYPE_BLE:
+                    devices[dev_id] = f"BLE: {dev.get(CONF_BLE_HOST, dev_id)}"
                 else:
-                    devices[dev_id] = dev.get(CONF_TUYA_IP, "")
+                    devices[dev_id] = dev.get(CONF_WIFI_HOST) or dev.get(
+                        CONF_TUYA_IP, ""
+                    )
 
         return self.async_show_form(
             step_id="add_device",
@@ -438,10 +670,34 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         errors = {}
         placeholders = {}
         dev_id = self.selected_device
+        await self._async_ensure_cloud_devices()
         cloud_devs = self.cloud_data.device_list
         if user_input is not None:
             try:
                 self.device_data = user_input.copy()
+                if dev_id in self.discovered_devices:
+                    _disc = self.discovered_devices[dev_id]
+                    wifi_host = _disc.get(CONF_WIFI_HOST) or _disc.get(CONF_TUYA_IP)
+                    ble_host = _disc.get(CONF_BLE_HOST)
+                    if wifi_host:
+                        self.device_data[CONF_WIFI_HOST] = wifi_host
+                    if ble_host:
+                        self.device_data[CONF_BLE_HOST] = ble_host
+                        self.device_data[CONF_BLE_UUID] = self.device_data.get(
+                            CONF_BLE_UUID,
+                            _disc.get("_cloud_ble_uuid")
+                            or _disc.get(CONF_BLE_UUID)
+                            or _disc.get("ble_mfr_dev_uuid", ""),
+                        )
+                    if user_input.get(CONF_CONNECTION_TYPE) == CONNECTION_TYPE_BLE and ble_host:
+                        self.device_data[CONF_HOST] = ble_host
+                        self.device_data[CONF_CONNECTION_TYPE] = CONNECTION_TYPE_BLE
+                    elif wifi_host:
+                        self.device_data[CONF_HOST] = wifi_host
+                        self.device_data[CONF_CONNECTION_TYPE] = CONNECTION_TYPE_WIFI
+                    elif ble_host:
+                        self.device_data[CONF_HOST] = ble_host
+                        self.device_data[CONF_CONNECTION_TYPE] = CONNECTION_TYPE_BLE
                 self.selected_device: str = dev_id or user_input.get(CONF_DEVICE_ID)
                 self.nodeID: str = self.nodeID or user_input.get(CONF_NODE_ID)
                 if dev_id is not None:
@@ -517,12 +773,30 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                         ]
                         return await self.async_step_configure_entity()
 
-                valid_data = await validate_input(self.localtuya_data, user_input)
-                self.dps_strings = valid_data[CONF_DPS_STRINGS]
-                # We will also get protocol version from valid date in case auto used.
-                self.device_data[CONF_PROTOCOL_VERSION] = valid_data[
-                    CONF_PROTOCOL_VERSION
-                ]
+                if user_input.get(CONF_CONNECTION_TYPE) == CONNECTION_TYPE_BLE or self._is_ble_device:
+                    # BLE devices: skip WiFi TCP validation; generate manual DPS strings.
+                    if self._is_ble_device:
+                        self.device_data[CONF_CONNECTION_TYPE] = CONNECTION_TYPE_BLE
+                    manual_dps = user_input.get(CONF_MANUAL_DPS, "")
+                    ble_dps = (
+                        [
+                            f"{dp.strip()} ( value: -1 )"
+                            for dp in manual_dps.split(",")
+                            if dp.strip().isdigit()
+                        ]
+                        if manual_dps
+                        else gen_dps_strings()
+                    )
+                    self.dps_strings = ble_dps
+                    # BLE devices don't have a protocol version; set a placeholder.
+                    self.device_data[CONF_PROTOCOL_VERSION] = "ble"
+                else:
+                    valid_data = await validate_input(self.localtuya_data, user_input)
+                    self.dps_strings = valid_data[CONF_DPS_STRINGS]
+                    # We will also get protocol version from valid date in case auto used.
+                    self.device_data[CONF_PROTOCOL_VERSION] = valid_data[
+                        CONF_PROTOCOL_VERSION
+                    ]
 
                 return await self.async_step_device_setup_method()
                 # return await self.async_step_pick_entity_type()
@@ -584,19 +858,95 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             if defaults[CONF_DEVICE_ID] in [cloud_devs, self.selected_device]:
                 dev_id = defaults[CONF_DEVICE_ID]
 
+            self._is_ble_device = False
             if dev_id is not None and dev_id in self.discovered_devices:
                 # Insert default values from discovery and cloud if present
                 device = self.discovered_devices.get(dev_id, {})
-                defaults[CONF_HOST] = device.get(CONF_TUYA_IP)
-                defaults[CONF_DEVICE_ID] = device.get(CONF_TUYA_GWID)
-                defaults[CONF_PROTOCOL_VERSION] = device.get(CONF_TUYA_VERSION)
-                defaults[CONF_NODE_ID] = device.get(CONF_NODE_ID, None)
+                device_wifi_host = device.get(CONF_WIFI_HOST) or device.get(CONF_TUYA_IP)
+                device_ble_host = device.get(CONF_BLE_HOST)
+                if device_ble_host and not device_wifi_host:
+                    self._is_ble_device = True
+                if device_ble_host:
+                    defaults[CONF_HOST] = device_wifi_host or device_ble_host
+                    defaults[CONF_FRIENDLY_NAME] = device.get(CONF_FRIENDLY_NAME, "")
+                    mfr_dev_uuid = device.get("ble_mfr_dev_uuid", "")
+                    matches = self._get_ble_cloud_matches(
+                        device_ble_host, device, cloud_devs
+                    )
+
+                    if device.get("_cloud_device_id"):
+                        _LOGGER.debug(
+                            "[BLE cloud match] Using picker-selected cloud device %s for MAC=%s",
+                            device["_cloud_device_id"],
+                            device_ble_host,
+                        )
+                        defaults[CONF_DEVICE_ID] = device["_cloud_device_id"]
+                        defaults[CONF_LOCAL_KEY] = device.get("_cloud_local_key", "")
+                        defaults[CONF_FRIENDLY_NAME] = device.get(
+                            "_cloud_friendly_name", defaults[CONF_FRIENDLY_NAME]
+                        )
+                        defaults[CONF_BLE_UUID] = device.get(
+                            "_cloud_ble_uuid", mfr_dev_uuid
+                        )
+                        matched = True
+                    else:
+                        matched = False
+
+                    if not matched and matches:
+                        top_match = matches[0]
+                        equally_scored = [
+                            match
+                            for match in matches
+                            if match["score"] == top_match["score"]
+                        ]
+                        if top_match["score"] >= 250 and len(equally_scored) == 1:
+                            cloud_dev_id = top_match["cloud_device_id"]
+                            cloud_dev = cloud_devs[cloud_dev_id]
+                            self._store_ble_cloud_credentials(dev_id, cloud_dev_id)
+                            _LOGGER.debug(
+                                "[BLE cloud match] Auto-selected cloud device %s for MAC=%s via %s",
+                                cloud_dev_id,
+                                device_ble_host,
+                                top_match["reason"],
+                            )
+                            defaults[CONF_DEVICE_ID] = cloud_dev_id
+                            defaults[CONF_LOCAL_KEY] = cloud_dev.get(CONF_LOCAL_KEY, "")
+                            defaults[CONF_FRIENDLY_NAME] = cloud_dev.get(
+                                CONF_NAME, defaults[CONF_FRIENDLY_NAME]
+                            )
+                            defaults[CONF_BLE_UUID] = cloud_dev.get("uuid", "")
+                            matched = True
+
+                    if not matched:
+                        # Pre-fill BLE UUID from manufacturer data; redirect to cloud picker step.
+                        if mfr_dev_uuid:
+                            defaults[CONF_BLE_UUID] = mfr_dev_uuid
+                        # Store device key so picker step can find it later
+                        self._ble_unmatched_device = dev_id
+                        _LOGGER.debug(
+                            "[BLE cloud match] No cloud match for MAC=%s. Redirecting to cloud picker.",
+                            device_ble_host,
+                        )
+                        return await self.async_step_ble_pick_cloud_device()
+                else:
+                    defaults[CONF_HOST] = device_wifi_host
+                    defaults[CONF_DEVICE_ID] = device.get(CONF_TUYA_GWID)
+                    defaults[CONF_PROTOCOL_VERSION] = device.get(CONF_TUYA_VERSION)
+                    defaults[CONF_NODE_ID] = device.get(CONF_NODE_ID, None)
 
             if dev_id in cloud_devs:
                 defaults[CONF_LOCAL_KEY] = cloud_devs[dev_id].get(CONF_LOCAL_KEY)
                 defaults[CONF_FRIENDLY_NAME] = cloud_devs[dev_id].get(CONF_NAME)
 
-            schema = schema_suggested_values(DEVICE_SCHEMA, **defaults)
+            connection_type = (
+                user_input.get(CONF_CONNECTION_TYPE, CONNECTION_TYPE_WIFI)
+                if user_input
+                else CONNECTION_TYPE_WIFI
+            )
+            if connection_type == CONNECTION_TYPE_BLE or self._is_ble_device:
+                schema = schema_suggested_values(DEVICE_SCHEMA_BLE, **defaults)
+            else:
+                schema = schema_suggested_values(DEVICE_SCHEMA, **defaults)
 
             placeholders["for_device"] = ""
 
@@ -607,20 +957,121 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             description_placeholders=placeholders,
         )
 
+    async def async_step_ble_pick_cloud_device(self, user_input=None):
+        """Let the user pick a cloud device to supply credentials for a BLE device.
+
+        Allow proceeding with manual entry when no confident automatic match exists.
+        """
+        await self._async_ensure_cloud_devices(force_update=True)
+        cloud_devs = self.cloud_data.device_list
+        dev_id = self._ble_unmatched_device  # BLE MAC
+        device = self.discovered_devices.get(dev_id, {})
+        mfr_dev_uuid = device.get("ble_mfr_dev_uuid", "")
+        ble_dev_uuid = device.get("ble_dev_uuid", "")
+        matches = (
+            self._get_ble_cloud_matches(dev_id, device, cloud_devs) if dev_id else []
+        )
+
+        _MANUAL_ENTRY = "__manual__"
+
+        if user_input is not None:
+            selected = user_input.get("cloud_device", _MANUAL_ENTRY)
+            stored = self.discovered_devices[dev_id]
+            if selected != _MANUAL_ENTRY and selected in cloud_devs:
+                self._store_ble_cloud_credentials(dev_id, selected)
+            else:
+                for k in (
+                    "_cloud_device_id",
+                    "_cloud_local_key",
+                    "_cloud_friendly_name",
+                    "_cloud_ble_uuid",
+                ):
+                    stored.pop(k, None)
+            self._ble_unmatched_device = None
+            return await self.async_step_configure_device()
+
+        best_candidate = matches[0] if matches else None
+        best_candidate_id = (
+            best_candidate["cloud_device_id"] if best_candidate else None
+        )
+        options = []
+        if best_candidate_id and best_candidate_id in cloud_devs:
+            cloud_dev = cloud_devs[best_candidate_id]
+            options.append(
+                SelectOptionDict(
+                    value=best_candidate_id,
+                    label=f"★ {cloud_dev.get(CONF_NAME, best_candidate_id)} ({best_candidate_id}) [{best_candidate['reason']}]",
+                )
+            )
+        for cloud_dev_id, cloud_dev in cloud_devs.items():
+            if cloud_dev_id == best_candidate_id:
+                continue
+            options.append(
+                SelectOptionDict(
+                    value=cloud_dev_id,
+                    label=f"{cloud_dev.get(CONF_NAME, cloud_dev_id)} ({cloud_dev_id})",
+                )
+            )
+        options.append(
+            SelectOptionDict(value=_MANUAL_ENTRY, label="Enter credentials manually")
+        )
+
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    "cloud_device", default=best_candidate_id or _MANUAL_ENTRY
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=options,
+                        mode=SelectSelectorMode.LIST,
+                    )
+                )
+            }
+        )
+        return self.async_show_form(
+            step_id="ble_pick_cloud_device",
+            data_schema=schema,
+            description_placeholders={
+                "mac": dev_id or "",
+                "ble_uuid": mfr_dev_uuid or ble_dev_uuid or "",
+            },
+        )
+
     async def async_step_auto_configure_device(self, user_input=None):
         """Handle asking which templates to use"""
 
         errors = {}
         placeholders = {}
 
+        await self._async_ensure_cloud_devices()
+
         # Gather the information
         is_cloud = not self.config_entry.data.get(CONF_NO_CLOUD)
         dev_id = self.selected_device
+        cloud_dev_id = dev_id
+        if dev_id in self.discovered_devices:
+            discovered_device = self.discovered_devices[dev_id]
+            if discovered_device.get(CONF_CONNECTION_TYPE) == CONNECTION_TYPE_BLE:
+                cloud_dev_id = discovered_device.get(
+                    "_cloud_device_id"
+                ) or self.device_data.get(CONF_DEVICE_ID, dev_id)
         category = None
         node_id = self.nodeID
-        device_data = self.cloud_data.device_list.get(dev_id)
+        device_data = self.cloud_data.device_list.get(cloud_dev_id)
         if device_data:
-            category = self.cloud_data.device_list[dev_id].get(TUYA_CATEGORY, "")
+            category = device_data.get(TUYA_CATEGORY, "")
+
+        # For BLE devices (and any device where dps_strings lack code annotations),
+        # fetch cloud DPS data and build proper dps_strings with code names so that
+        # gen_localtuya_entities can match entity configurations.
+        has_codes = any("code:" in dp for dp in (self.dps_strings or []))
+        if not has_codes and device_data:
+            if not device_data.get("dps_data"):
+                await self.cloud_data.async_get_device_functions(cloud_dev_id)
+                device_data = self.cloud_data.device_list.get(cloud_dev_id)
+            cloud_dp_codes = (device_data or {}).get("dps_data", {})
+            if cloud_dp_codes:
+                self.dps_strings = dps_string_list({}, cloud_dp_codes)
 
         localtuya_data = {
             DEVICE_CLOUD_DATA: device_data,
@@ -1055,6 +1506,9 @@ def options_schema(entities):
             vol.Optional(CONF_MANUAL_DPS): cv.string,
             vol.Optional(CONF_RESET_DPIDS): cv.string,
             vol.Optional(CONF_DEVICE_SLEEP_TIME): int,
+            vol.Optional(CONF_BLE_UUID): cv.string,
+            vol.Optional(CONF_BLE_NOTIF_UUID): cv.string,
+            vol.Optional(CONF_BLE_CHAR_UUID): cv.string,
             vol.Required(
                 CONF_ENTITIES, description={"suggested_value": entity_names}
             ): cv.multi_select(entity_names),

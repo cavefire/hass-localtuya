@@ -203,6 +203,31 @@ CONF_TARGET_TEMPERATURE_HIGH_DP = "target_temperature_high_dp"
 ATTR_STATE = "raw_state"
 CONF_RESTORE_ON_RECONNECT = "restore_on_reconnect"
 
+# Connection type
+CONF_CONNECTION_TYPE = "connection_type"
+CONF_WIFI_HOST = "wifi_host"
+CONF_BLE_HOST = "ble_host"
+CONF_BLE_UUID = "ble_uuid"
+CONF_BLE_NOTIF_UUID = "ble_notif_uuid"
+CONF_BLE_CHAR_UUID = "ble_char_uuid"
+CONF_TRANSPORT_PREFERENCE = "transport_preference"
+
+CONNECTION_TYPE_WIFI = "wifi"
+CONNECTION_TYPE_BLE = "ble"
+
+TRANSPORT_PREFER_WIFI = "prefer_wifi"
+TRANSPORT_PREFER_BLE = "prefer_ble"
+TRANSPORT_WIFI_ONLY = "wifi_only"
+TRANSPORT_BLE_ONLY = "ble_only"
+
+TUYA_BLE_SERVICE_UUID = "0000a201-0000-1000-8000-00805f9b34fb"
+
+
+def normalize_mac(value: str) -> str:
+    """Normalize a MAC address to lowercase without separators."""
+    return value.replace(":", "").lower()
+
+
 # Categories
 ENTITY_CATEGORY = {
     "None": None,
@@ -290,6 +315,20 @@ class DeviceConfig:
         self.reset_dps: str = self.device_config.get(CONF_RESET_DPIDS, "")
         self.manual_dps: str = self.device_config.get(CONF_MANUAL_DPS, "")
         self.dps_strings: list = self.device_config.get(CONF_DPS_STRINGS, [])
+        self.connection_type: str = self.device_config.get(
+            CONF_CONNECTION_TYPE, CONNECTION_TYPE_WIFI
+        )
+        self.wifi_host: str = self.device_config.get(
+            CONF_WIFI_HOST,
+            self.host if self.connection_type != CONNECTION_TYPE_BLE else "",
+        )
+        self.ble_host: str = self.device_config.get(
+            CONF_BLE_HOST,
+            self.host if self.connection_type == CONNECTION_TYPE_BLE else "",
+        )
+        self.ble_uuid: str = self.device_config.get(CONF_BLE_UUID, "")
+        self.ble_notif_uuid: str = self.device_config.get(CONF_BLE_NOTIF_UUID, "")
+        self.ble_char_uuid: str = self.device_config.get(CONF_BLE_CHAR_UUID, "")
 
     def as_dict(self):
         return self.device_config

@@ -7,6 +7,7 @@ from homeassistant.core import HomeAssistant, State
 from homeassistant.config_entries import ConfigEntry
 
 from homeassistant.const import (
+    ATTR_CONNECTIONS,
     CONF_DEVICES,
     CONF_DEVICE_CLASS,
     CONF_ENTITIES,
@@ -21,7 +22,7 @@ from homeassistant.const import (
     STATE_UNKNOWN,
     ATTR_VIA_DEVICE,
 )
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
@@ -223,6 +224,10 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             model=f"{device_config.model} ({device_config.id})",
             sw_version=device_config.protocol_version,
         )
+        if device_config.ble_host and not self._device.is_subdevice:
+            device_info[ATTR_CONNECTIONS] = {
+                (CONNECTION_BLUETOOTH, device_config.ble_host.upper())
+            }
         if self._device.is_subdevice and self._device.id != self._device.gateway.id:
             device_info[ATTR_VIA_DEVICE] = (DOMAIN, f"local_{self._device.gateway.id}")
         return device_info

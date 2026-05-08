@@ -1,9 +1,8 @@
 """Platform to present any Tuya DP as a sensor."""
 
-import logging
 import base64
+import logging
 from functools import partial
-from .config_flow import col_to_select
 
 import voluptuous as vol
 from homeassistant.components.sensor import (
@@ -15,18 +14,32 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import (
+    ATTR_CONNECTIONS,
+    ATTR_VIA_DEVICE,
+    CONF_DEVICES,
     CONF_DEVICE_CLASS,
+    CONF_HOST,
     CONF_UNIT_OF_MEASUREMENT,
+    EntityCategory,
     Platform,
     STATE_UNKNOWN,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
     UnitOfPower,
 )
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers import entity_registry as er
 
+from .config_flow import col_to_select
 from .entity import LocalTuyaEntity, async_setup_entry
-from .const import CONF_SCALING, CONF_STATE_CLASS
+from .const import (
+    CONF_NODE_ID,
+    CONF_SCALING,
+    CONF_STATE_CLASS,
+    DOMAIN,
+    DeviceConfig,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -164,4 +177,85 @@ class LocalTuyaSensor(LocalTuyaEntity, SensorEntity):
             )
 
 
-async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaSensor, flow_schema)
+class LocalTuyaTransportSensor(SensorEntity):
+    """Diagnostic sensor that exposes the active connection transport."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_has_entity_name = True
+    _attr_name = "Active Transport"
+    _attr_should_poll = False
+
+    def __init__(self, device, device_config: dict):
+        """Initialize the transport sensor."""
+        self._device = device
+        self._device_config = DeviceConfig(device_config)
+        self._attr_unique_id = f"local_{self._device_config.id}_active_transport"
+
+    @property
+    def native_value(self):
+        """Return the current transport state."""
+        return self._device.active_transport or "disconnected"
+
+    @property
+    def available(self):
+        """The transport sensor is always available."""
+        return True
+
+    @property
+    def device_info(self):
+        """Return device registry information for this entity."""
+        device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"local_{self._device_config.id}")},
+            name=self._device_config.name,
+            manufacturer="Tuya",
+            model=f"{self._device_config.model} ({self._device_config.id})",
+            sw_version=self._device_config.protocol_version,
+        )
+        if self._device_config.ble_host and not self._device.is_subdevice:
+            device_info[ATTR_CONNECTIONS] = {
+                (CONNECTION_BLUETOOTH, self._device_config.ble_host.upper())
+            }
+        if self._device.is_subdevice and self._device.id != self._device.gateway.id:
+            device_info[ATTR_VIA_DEVICE] = (DOMAIN, f"local_{self._device.gateway.id}")
+        return device_info
+
+    async def restore_state_when_connected(self) -> None:
+        """No-op: transport sensor has no state to restore on connect."""
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to dispatcher updates and hide the entity by default."""
+        signal = f"localtuya_{self._device_config.id}"
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, signal, lambda _status: self.schedule_update_ha_state()
+            )
+        )
+        await super().async_added_to_hass()
+        er.async_get(self.hass).async_update_entity(
+            self.entity_id, hidden_by=er.RegistryEntryHider.INTEGRATION
+        )
+
+
+_BASE_ASYNC_SETUP_ENTRY = partial(async_setup_entry, DOMAIN, LocalTuyaSensor, flow_schema)
+
+
+async def async_setup_entry(hass, config_entry, async_add_entities):
+    """Set up LocalTuya sensors and the hidden active transport sensor."""
+    await _BASE_ASYNC_SETUP_ENTRY(hass, config_entry, async_add_entities)
+
+    transport_entities = []
+    hass_entry_data = hass.data[DOMAIN][config_entry.entry_id]
+    for dev_id, dev_entry in config_entry.data[CONF_DEVICES].items():
+        host = dev_entry.get(CONF_HOST)
+        node_id = dev_entry.get(CONF_NODE_ID)
+        device_key = f"{host}_{node_id}" if node_id else host
+        if device_key not in hass_entry_data.devices:
+            continue
+        transport_entities.append(
+            LocalTuyaTransportSensor(hass_entry_data.devices[device_key], dev_entry)
+        )
+
+    if transport_entities:
+        for entity in transport_entities:
+            entity._device.add_entities([entity])
+        async_add_entities(transport_entities)
